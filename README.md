@@ -1,2 +1,2 @@
 # redis-from-scratch
-An attempt create redis like data structure from scratch.
+An attempt to create redis like data server from scratch.
