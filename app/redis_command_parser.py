@@ -1,139 +1,105 @@
-from dataclasses import dataclass
-from socket import socket
 import logging
+from typing import IO, Any
+from enum import StrEnum, auto
+from .exceptions import RedisSocketReadError, RedisCommandError
 
 
-@dataclass
-class Error:
-    message: str
+class UpperCaseStrEnum(StrEnum):
+    # Subclass of string enum that saves values with uppercase values
+    @staticmethod
+    def _generate_next_value_(name: str, *args: Any) -> str:
+        return name.upper()
 
 
-class CommandError(Exception):
-    pass
+class RedisCommand(UpperCaseStrEnum):
+    PING = auto()
+    ECHO = auto()
+    SET = auto()
+    GET = auto()
+    DELETE = auto()
+    INFO = auto()
+    REPLCONF = auto()
+    PSYNC = auto()
 
 
 class RedisCommandParser(object):
-    def __init__(self, socket_conn: socket):
+    def __init__(self, file_socket: IO[bytes]):
         self.logger = logging.getLogger(__name__)
+        self.file_socket = file_socket
 
-        # Convert socket_conn (a socket object) into a file-like object.
-        self.fsocket = socket_conn.makefile("rwb")
+    def get_redis_command(self) -> [RedisCommand, list]:
+        redis_packet = self._read_raw_redis_packet()
+        command = RedisCommand(redis_packet[0])
+        args = redis_packet[1:]
+        return command, args
 
-        self._data_handlers = {
-            "+": self._handle_simple_string,
-            "-": self._handle_error,
-            ":": self._handle_integer,
-            "$": self._handle_bulk_string,
-            "*": self._handle_array,
-            "%": self._handle_dict,
-        }
-        self._command_handlers = {
-            "GET": self._handle_command_get,
-            "SET": self._handle_command_set,
-            "DELETE": 3,
-            "FLUSH": 4,
-            "MGET": 5,
-            "MSET": 6,
-            "PING": self._handle_command_ping,
-            "ECHO": self._handle_command_echo,
-        }
-
-        # This is the in-memory key-value storage for redis.
-        self._redis_storage = {}
-
-    def parse_command(self):
+    def _read_raw_redis_packet(self) -> list[str]:
         """
-        First parse the request received from the client, and get the data.
-        Then take action and prepare response to send to the client.
-        :return:
-        """
-        data = self._parse_resp_input_data()
-        command = data[0]
-        return self._command_handlers[command](data[1:])
-
-    def _parse_resp_input_data(self):
-        """
-        Parse according to this protocol:
+        Handles redis packets. The packet is structured according to the following protocols:
         https://redis.io/docs/latest/develop/reference/protocol-spec/#resp-protocol-description
+
+        Raises:
+            RedisCommandError during command errors.
         """
         # The first byte defines the data type.
-        data_type = self.fsocket.read(1).decode("utf-8")
-        if not data_type:
-            raise CommandError("Empty data type / first byte.")
+        data_type = self._read_char_from_socket()
 
-        try:
-            # Delegate to the appropriate handler based on the first byte.
-            return self._data_handlers[data_type]()
-        except KeyError:
-            raise CommandError(f"Unsupported data type: {data_type}")
+        match data_type:
+            case "-":
+                """
+                Handle an error message.
+                Format: -Error message\r\n
+                Example: -ERR unknown command 'asdf'\r\n
+                """
+                error_msg = self.file_socket.readline().decode("utf-8").rstrip("\r\n")
+                raise RedisCommandError(error_msg)
 
-    def _handle_command_ping(self, data: list) -> bytes:
+            case "*":
+                """
+                Handle an array.
+                Except error, all redis packets come as an array.
+
+                Format: *<number of elements>\r\n<0 or more of $>\r\n
+                Example:
+                    SET: *3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nHello\r\n
+                    DEL: *2\r\n$3\r\nDEL\r\n$5\r\nmykey\r\n
+                    FLUSHALL: *1\r\n$8\r\nFLUSHALL\r\n
+                    ECHO: *2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n
+                    PING: *1\r\n$4\r\nPING\r\n
+                """
+                num_elements = int(self.file_socket.readline().rstrip(b"\r\n"))
+                return [self._read_bulk_string() for _ in range(num_elements)]
+
+            case _:
+                raise RedisCommandError(f"Invalid data type: {data_type}")
+
+    def _read_char_from_socket(self) -> str:
         """
-        We will receive: *1\r\n$4\r\nPING\r\n
+        Read one byte from the socket, convert it to character and return that.
+
+        Returns:
+             One string character.
         """
-        self.logger.debug(f"Received {data[0]} command.")
-        return b"+PONG\r\n"
+        char = self.file_socket.read(1).decode("utf-8")
+        if not char:
+            raise RedisSocketReadError("Read byte failed, empty byte.")
 
-    def _handle_command_echo(self, data: list) -> bytes:
+        return char
+
+    def _read_bulk_string(self) -> str:
         """
-        The ECHO command: *2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n
-        Method will receive: hey
-        The response should be: $3\r\nhey\r\n
+        Read bulk string from the socket.
+        Format: $<length>\r\n<length of bytes>\r\n
+
+        Note: Bulk string is a type in Redis protocol.
         """
-        self.logger.debug("Received ECHO command.")
-        echo_val = f"${len(data[0])}\r\n{data[0]}\r\n".encode("utf-8")
-        return echo_val
+        data_type = self._read_char_from_socket()
+        if data_type != "$":
+            raise RedisCommandError(f"Invalid data type: {data_type}. Expected: $")
 
-    def _handle_command_set(self, data: list) -> bytes:
-        # The SET command: *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
-        # Method will receive: ["foo", "bar"]
-        # The response should be: +OK\r\n
-        self.logger.debug("Received SET command.")
-        key, value = data
-        self._redis_storage[key] = value
-        return b"+OK\r\n"
-
-    def _handle_command_get(self, data: list) -> bytes:
-        # The SET command: *2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n
-        # Method will receive: ["foo"]
-        # The response should be: $3\r\nbar\r\n
-        self.logger.debug("Received GET command.")
-
-        value = self._redis_storage.get(data[0], None)
-        if value is None:
-            return b"$-1\r\n"
-        return f"${len(value)}\r\n{value}\r\n".encode("utf-8")
-
-    def _handle_simple_string(self):
-        return self.fsocket.readline().decode("utf-8").rstrip("\r\n")
-
-    def _handle_error(self):
-        error_msg = self.fsocket.readline().decode("utf-8").rstrip("\r\n")
-        return Error(error_msg)
-
-    def _handle_integer(self):
-        return int(self.fsocket.readline().rstrip(b"\r\n"))
-
-    def _handle_bulk_string(self):
-        """
-        Format: $<length>\r\n<data>\r\n
-        """
-        # First read the length ($<length>\r\n).
-        length = int(self.fsocket.readline().rstrip(b"\r\n"))
+        # First read the length (<length>\r\n).
+        length = int(self.file_socket.readline().rstrip(b"\r\n"))
         length += 2  # Include the trailing \r\n in count.
-        return self.fsocket.read(length)[:-2].decode("utf-8")
 
-    def _handle_null(self):
-        pass
-
-    def _handle_array(self):
-        """
-        *<number of elements>\r\n<0 or more of above>\r\n
-        """
-        num_elements = int(self.fsocket.readline().rstrip(b"\r\n"))
-        return [self._parse_resp_input_data() for _ in range(num_elements)]
-
-    def _handle_dict(self):
-        num_items = int(self.fsocket.readline().rstrip(b"\r\n"))
-        elements = [self._parse_resp_input_data() for _ in range(num_items * 2)]
-        return dict(zip(elements[::2], elements[1::2]))
+        # Return just the string, no length, no \r\n.
+        return self.file_socket.read(length)[:-2].decode("utf-8")
